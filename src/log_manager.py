@@ -17,6 +17,7 @@ class LogManager:
         self.latest_term_in_logs = 0
         self.highest_index = 1
         self.log_recently_changed = False
+        self.commitIndex = self.highest_index
 
     def get(self, key):
         return self.data.get(key, '')
@@ -38,7 +39,7 @@ class LogManager:
             while '' in log_list:
                 log_list.remove('')
             f.seek(0)
-            for line_to_keep in log_list[0:index + 1]:
+            for line_to_keep in log_list[0:index]:
                 f.write(line_to_keep)
             f.truncate()
             f.close()
@@ -55,7 +56,7 @@ class LogManager:
             while '' in log_list:
                 log_list.remove('')
             f.close()
-            logList = [' '.join(string.rstrip("\n").split(" ")[2:]) for string in log_list[index + 1:]]
+            logList = [' '.join(string.rstrip("\n").split(" ")) for string in log_list[index:]]
             return logList
 
 
@@ -126,8 +127,6 @@ class LogManager:
             else:
                 pass
 
-        print("WRITE TO STATE " + str(string_operation))
-        print("DATA " + str(self.data))
         return response
 
     def read(self, string_operation):
@@ -147,7 +146,6 @@ class LogManager:
         return response
 
     def write_to_log(self, string_operation, term_absent, path_to_logs=''):
-        print("Writing to log: " + string_operation)
         self.log_recently_changed = True
         if len(string_operation) == 0:
             return ''
@@ -158,16 +156,13 @@ class LogManager:
             index, term, command, key, values = 0, 1, 2, 3, 4
         if operands[command] in ["set", "delete"]:
             if term_absent:
-                self.highest_index += 1
                 string_operation = str(self.highest_index) + " " + str(self.current_term) + " " + string_operation
-            else:
-                self.highest_index = index + 1
-                self.latest_term_in_logs = term
             if path_to_logs == '':
                 path_to_logs = "logs/" + self.server_name + "_log.txt"
             f = open(path_to_logs, "a+")
             f.write(string_operation + '\n')
             f.close()
+
             self.latest_term_in_logs = self.current_term
             return string_operation
         return ''

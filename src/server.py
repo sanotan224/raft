@@ -50,6 +50,7 @@ class Server:
         self.election_allowed = True
 
     def start_election(self):
+        self.election_allowed = True
         if not self.leader:
             self.log_manager.current_term += 1
             self.timeout = float(random.randint(10, 18))
@@ -87,7 +88,6 @@ class Server:
     def start(self):
         server_address = ('localhost', self.port)
         print("starting up on " + str(server_address[0]) + " port " + str(server_address[1]))
-        print("my index and term " + str(self.log_manager.highest_index) + " " + str(self.log_manager.current_term))
         self.server_socket = socket(AF_INET, SOCK_STREAM)
         self.server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.server_socket.bind(server_address)
@@ -106,16 +106,16 @@ class Server:
                 self,
                 AppendEntriesCall(
                     in_term=self.log_manager.current_term,
-                    previous_index=self.log_manager.highest_index + 1,
+                    previous_index=self.log_manager.highest_index,
                     previous_term=self.log_manager.latest_term_in_logs,
-                    entries=[]
+                    entries=[],
+                    leaderCommit=self.log_manager.commitIndex
                 ).to_message()
             ))
             self.heartbeat_timer = threading.Timer(5.0, self.prove_aliveness)
             self.heartbeat_timer.start()
 
     def mark_updated(self, server_name):
-        print("MARK UPDATED")
         self.followers_with_update_status[server_name] = True
         if self.current_operation == '':
             return
@@ -124,14 +124,14 @@ class Server:
         if trues >= falses:
             print("Committing entry: " + self.current_operation)
             self.current_operation_committed = True
-            self.log_manager.highest_index = self.log_manager.highest_index + 1
             self.broadcast(self, self.with_return_address(
                 self,
                 AppendEntriesCall(
                     in_term=self.log_manager.current_term,
                     previous_index=self.log_manager.highest_index,
                     previous_term=self.log_manager.latest_term_in_logs,
-                    entries=[]
+                    entries=[],
+                    leaderCommit=self.log_manager.commitIndex
                 ).to_message()
             ))
             self.current_operation = ''
@@ -143,8 +143,9 @@ class Server:
         self.log_manager.voted_for_me[server_name] = True
         trues = len(list(filter(lambda x: x is True, self.log_manager.voted_for_me.values())))
         falses = len(list(filter(lambda x: x is False, self.log_manager.voted_for_me.values())))
-        if trues >= falses:
+        if trues >= falses and not self.leader:
             print("I win the election for term " + str(self.log_manager.current_term) + "!")
+            self.log_manager.highest_index = self.log_manager.highest_index + 1
             self.leader = True
             self.prove_aliveness()
             for server_name in self.log_manager.voted_for_me.keys():
@@ -191,14 +192,16 @@ class Server:
 
         if string_operation.split(" ")[0] == "append_entries_call":
             call = AppendEntriesCall.from_message(string_operation)
-            print("INDEX IN APDCALL " + str(call.previous_index) + " " + str(self.log_manager.highest_index))
-            '''if call.previous_index != self.log_manager.highest_index:
-                response = AppendEntriesResponse(self.log_manager.current_term, self.log_manager.highest_index, False).to_message()
-            elif call.in_term < self.log_manager.current_term:
-                 response = AppendEntriesResponse(self.log_manager.current_term + 1, self.log_manager.highest_index, False).to_message()
+            if call.in_term < self.log_manager.current_term:
+                response = AppendEntriesResponse(self.log_manager.current_term, self.log_manager.highest_index,
+                                             False).to_message()
+            elif call.previous_index < self.log_manager.highest_index:
+                response = AppendEntriesResponse(self.log_manager.current_term, self.log_manager.highest_index,
+                                                 False).to_message()
+            elif call.previous_index > self.log_manager.highest_index + 1 and self.latest_leader == "Yet unelected":
+                response = AppendEntriesResponse(self.log_manager.current_term, self.log_manager.highest_index,
+                                                 False).to_message()
             else:
-            '''
-            if True:
                 self.election_allowed = False
                 self.election_countdown.cancel()
                 self.election_countdown = threading.Timer(self.timeout, self.start_election)
@@ -212,11 +215,14 @@ class Server:
                 self.latest_leader = server_name
                 self.latest_leader_port = server_port
 
+                for log in call.entries:
+                    self.log_manager.write_to_log(log, term_absent=False)
+                    self.log_manager.write_to_state_machine(log, term_absent=False)
 
-                log_manager.remove_logs_after_index(call.previous_index)
-                [log_manager.write_to_log(log, term_absent=False) for log in call.entries]
-                [log_manager.write_to_state_machine(command, term_absent=False) for command in call.entries]
-                response = AppendEntriesResponse(self.log_manager.current_term + 1, self.log_manager.highest_index, True).to_message()
+                self.log_manager.highest_index = call.previous_index - 1
+                if call.leaderCommit > self.log_manager.commitIndex:
+                    self.log_manager.commitIndex = min(call.leaderCommit, self.log_manager.highest_index)
+                response = AppendEntriesResponse(self.log_manager.current_term, self.log_manager.highest_index, True).to_message()
                 print("State machine after committing: " + str(log_manager.data))
 
         elif string_operation.split(" ")[0] == "append_entries_response":
@@ -226,17 +232,20 @@ class Server:
                     self.mark_updated(server_name)
                     self.log_manager.current_term = call.term
                 send_pending = False
-            elif self.log_manager.highest_index != call.index:
+            elif self.log_manager.current_term < call.term:
+                self.log_manager.current_term = call.term
+            else:
                 if self.leader:
                     response = AppendEntriesCall(
                         in_term=self.log_manager.current_term,
-                        previous_index=call.index - 1,
+                        previous_index=call.index + 1,
                         previous_term=self.log_manager.current_term,
-                        entries=self.log_manager.get_logs_after_index(call.index - 1)
+                        entries=self.log_manager.get_logs_after_index(call.index - 1),
+                        leaderCommit=self.log_manager.commitIndex
                     ).to_message()
 
         elif string_operation.split(" ")[0] == "request_vote_call":
-            if self.allow_election:
+            if self.election_allowed:
                 request_vote_call = RequestVoteCall.from_message(string_operation)
                 if request_vote_call.for_term > self.log_manager.current_term \
                         and request_vote_call.latest_log_term >= self.log_manager.latest_term_in_logs \
@@ -250,30 +259,29 @@ class Server:
                 response = RequestVoteResponse(self.log_manager.current_term, False).to_message()
 
         elif string_operation.split(" ")[0] == "request_vote_response":
-            print("RequestVoteResponse!!!!!!")
             call = RequestVoteResponse.from_message(string_operation)
             if call.voteGranted:
                 self.mark_voted(server_name)
                 self.log_manager.current_term += 1
-                send_pending = False
+            send_pending = False
         else:
             if self.leader:
                 self.current_operation = string_operation
-
                 if self.current_operation.split(" ")[0] in ["set", "delete"]:
                     log_manager.write_to_state_machine(string_operation, term_absent=True)
                     string_operation_with_term = log_manager.write_to_log(string_operation, term_absent=True)
                     print(string_operation_with_term)
+                    self.log_manager.highest_index = self.log_manager.highest_index + 1
                     self.broadcast(self, self.with_return_address(
                         self,
                         AppendEntriesCall(
                             in_term=self.log_manager.current_term,
-                            previous_index=self.log_manager.highest_index - 1,
+                            previous_index=self.log_manager.highest_index,
                             previous_term=self.log_manager.latest_term_in_logs,
-                            entries=[string_operation_with_term]
+                            entries=[string_operation_with_term],
+                            leaderCommit=self.log_manager.commitIndex
                         ).to_message()
                     ))
-
                     response = "OK leader!"
                 else:
                     response = log_manager.read(self.current_operation)
